@@ -984,7 +984,7 @@ impl EditorView {
                     nodes
                         .iter()
                         .take(visual_cursor_row as usize)
-                        .map(|elem| elem.clone())
+                        .cloned()
                         .collect(),
                 );
             }
