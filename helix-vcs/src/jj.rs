@@ -2,8 +2,7 @@
 //! it could also have private backends. Those make it hard to use `jj-lib` since it won't have
 //! access to newer or private backends and fail to compute the diffs for them.
 //!
-//! Instead in case there *is* a diff to base ourselves on, we copy it to a tempfile or just use the
-//! current file if not.
+//! Instead, we shell out to the `jj` binary to obtain diff bases and changed-file lists.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,55 +18,32 @@ pub(super) fn get_diff_base(repo: &Path, file: &Path) -> Result<Vec<u8>> {
         .strip_prefix(repo)
         .context("failed to strip JJ repo root path from file")?;
 
-    let tmpfile = tempfile::NamedTempFile::with_prefix("helix-jj-diff-")
-        .context("could not create tempfile to save jj diff base")?;
-    let tmppath = tmpfile.path();
-
-    let copy_bin = if cfg!(windows) { "copy.exe" } else { "cp" };
-
-    let status = Command::new("jj")
-        // Ensure we're working in the expected repository.
+    let output = Command::new("jj")
         .arg("--repository")
         .arg(repo)
         .args([
             // Do not commit changes: this avoids Helix updating the JJ state every time this runs.
             "--ignore-working-copy",
-            "diff",
             // Ensuring no configuration option will interfere.
+            "file",
+            "show",
+            "--revision",
+            "@-",
             "--color",
             "never",
             "--no-pager",
-            // Work with current revision only.
-            "--revision",
-            "@",
-            // Pass custom diff configuration.
-            "--config",
         ])
-        // Copy the temporary file provided by jujutsu to a temporary path of our own,
-        // because the `$left` directory is deleted when `jj` finishes executing.
-        .arg(format!(
-            "ui.diff-formatter=['{exe}', '$left/{base}', '{target}']",
-            exe = copy_bin,
-            base = file_relative_to_root.display(),
-            // Where to copy the jujutsu-provided file
-            target = tmppath.display(),
-        ))
-        // Restrict the diff to the current file
-        .arg(file)
-        .stdout(std::process::Stdio::null())
+        .arg(format!("root:{}", file_relative_to_root.display()))
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .status()
-        .context("failed to execute `jj diff` to get diff base")?;
+        .output()
+        .context("failed to execute `jj file show` to get diff base")?;
 
-    let use_jj_path = status.success() && std::fs::metadata(tmppath).is_ok_and(|m| m.len() > 0);
-    // If the copy call inside `jj diff` succeeded, the tempfile is the one containing the base
-    // else it's just the original file (so no diff). We check for size since `jj` can return
-    // 0-sized files when there are no diffs to present for the file.
-    let diff_base_path = if use_jj_path { tmppath } else { file };
-
-    // If the command succeeded, it means we either copied the jujutsu base or defaulted to the
-    // current file, so there should always be something to read and compare to.
-    std::fs::read(diff_base_path).context("could not read jj diff base from the target")
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 pub(crate) fn get_current_head_name(repo: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
@@ -498,6 +474,61 @@ mod tests {
         ] {
             assert_eq!(entry("modified", invalid_types), None);
         }
+    }
+
+    fn setup_jj_repo(dir: &std::path::Path) {
+        let ok = |cmd: &mut std::process::Command| {
+            cmd.status().expect("jj setup command failed").success()
+        };
+        assert!(ok(std::process::Command::new("jj")
+            .args(["git", "init"])
+            .current_dir(dir)));
+        assert!(ok(std::process::Command::new("jj")
+            .args(["config", "set", "--repo", "user.email", "test@test.com"])
+            .current_dir(dir)));
+        assert!(ok(std::process::Command::new("jj")
+            .args(["config", "set", "--repo", "user.name", "Test"])
+            .current_dir(dir)));
+    }
+
+    #[test]
+    fn test_get_diff_base_returns_parent_content_for_modified_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        setup_jj_repo(repo);
+
+        let file_path = repo.join("hello.txt");
+        std::fs::write(&file_path, b"original content\n").unwrap();
+        assert!(std::process::Command::new("jj")
+            .args(["describe", "-m", "add hello.txt"])
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("jj")
+            .args(["new"])
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
+
+        std::fs::write(&file_path, b"modified content\n").unwrap();
+
+        let result = get_diff_base(repo, &file_path).unwrap();
+        assert_eq!(result, b"original content\n");
+    }
+
+    #[test]
+    fn test_get_diff_base_returns_empty_for_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        setup_jj_repo(repo);
+
+        let file_path = repo.join("new_file.txt");
+        std::fs::write(&file_path, b"brand new content\n").unwrap();
+
+        let result = get_diff_base(repo, &file_path).unwrap();
+        assert!(result.is_empty());
     }
 
     #[test]
