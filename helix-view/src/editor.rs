@@ -1624,7 +1624,12 @@ impl Editor {
     }
 
     /// Refreshes the language server for a given document
+    ///
+    /// This will clear all exisiting diagnostics for the document
     pub fn refresh_language_servers(&mut self, doc_id: DocumentId) {
+        if let Some(doc) = self.documents.get_mut(&doc_id) {
+            doc.diagnostics.clear();
+        };
         self.launch_language_servers(doc_id)
     }
 
@@ -2122,12 +2127,12 @@ impl Editor {
                 .workspace_trust
                 .query(doc.workspace_root(), TrustQuery::Git)
                 .is_trusted();
-            if let Some(diff_base) = self.diff_providers.get_diff_base(&path, trust_full) {
+            // When opening a *new* file, ensure its diff provider is loaded.
+            self.diff_providers.add(&path, trust_full);
+            if let Some(diff_base) = self.diff_providers.get_diff_base(&path) {
                 doc.set_diff_base(diff_base);
             }
-            doc.set_version_control_head(
-                self.diff_providers.get_current_head_name(&path, trust_full),
-            );
+            doc.set_version_control_head(self.diff_providers.get_current_head_name(&path));
 
             let id = self.new_document(doc);
             self.launch_language_servers(id);
@@ -2161,6 +2166,10 @@ impl Editor {
         };
         if !force && doc.is_modified() {
             return Err(CloseError::BufferModified(doc.display_name().into_owned()));
+        }
+
+        if let Some(path) = doc.path() {
+            self.diff_providers.remove(path);
         }
 
         // This will also disallow any follow-up writes
